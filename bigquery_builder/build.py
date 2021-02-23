@@ -1,16 +1,22 @@
 import os
 import json
 import hashlib
+import pathlib
 from collections import deque
 from urllib.parse import quote_plus
 import google.auth
 from google.cloud import bigquery
+import markdown
 
 class Builder():
     SQL_TOP_KEYWORDS = ["SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING"]
     project_id = google.auth.default()[1]
     client = bigquery.Client()
-    model_path = os.path.join(".", "models")
+    def __init__(self, model_path: str):
+        if os.path.exists(model_path):
+            self.model_path = model_path
+        else:
+            raise ValueError("Model Path Wrong")
 
     def create_view(self, dataset: str, view_name: str, node_name: str = "Semantics"):
         with open(os.path.join(self.model_path, "views", view_name + ".sql")) as fp:
@@ -19,7 +25,7 @@ class Builder():
         if node_name == "Semantics":
             view_id = ".".join([self.project_id, dataset, view_name])
         else:
-            view_id = ".".join([self.project_id, "debug", hashlib.md5(view_name.encode()).hexdigest()])
+            view_id = ".".join([self.project_id, "debug", hashlib.md5((view_name + node_name).encode()).hexdigest()])
             node_name = node_name.replace(";", "")
             query = query.replace("SELECT * FROM Semantics", "SELECT * FROM " + node_name)
 
@@ -27,7 +33,7 @@ class Builder():
         view = bigquery.Table(view_id)
         view.view_query = query
         view = self.client.create_table(view)
-        print(str(view.reference))
+        return str(view.reference)
 
     def create_table(self, dataset: str, table_name: str):
         table_id = ".".join([self.project_id, dataset, table_name])
@@ -44,41 +50,34 @@ class Builder():
         )
         create_job = self.client.query(create_query, job_config=job_config)
         create_job.result()
-        print(table_id)
+        return table_id
 
-    def get_dependencies(self, type: str, name: str):
-        with open(os.path.join(self.model_path, type, name, "config.json")) as fp:
-            conf = json.load(fp)
-        dependencies = conf.pop("dependencies")
-        view_dep = [{"type": "view", "name": i.split(".")[-1]} for i in dependencies.get("views", [])]
-        table_dep = [{"type": "table", "name": i.split(".")[-1]} for i in dependencies.get("tables", [])]
-        return view_dep + table_dep
-
-    def get_preview_url(self, dataset: str, name: str, node_name: str = "Semantics"):
+    @classmethod
+    def get_preview_url(cls, dataset: str, name: str, node_name: str = "Semantics"):
         if node_name == "Semantics":
-            preview_config = json.dumps({"projectId": self.project_id,
+            preview_config = json.dumps({"projectId": cls.project_id,
                                          "datasetId": dataset,
                                          "tableId": name,
-                                         "billingProjectId": self.project_id,
+                                         "billingProjectId": cls.project_id,
                                          "connectorType": "BIG_QUERY",
                                          "sqlType": "STANDARD_SQL"}, ensure_ascii=False)
         else:
-            self.create_view(dataset, name, node_name)
-            preview_config = json.dumps({"projectId": self.project_id,
+            preview_config = json.dumps({"projectId": cls.project_id,
                                          "datasetId": "debug",
-                                         "tableId": hashlib.md5(name.encode()).hexdigest(),
-                                         "billingProjectId": self.project_id,
+                                         "tableId": hashlib.md5((name + node_name).encode()).hexdigest(),
+                                         "billingProjectId": cls.project_id,
                                          "connectorType": "BIG_QUERY",
                                          "sqlType": "STANDARD_SQL"}, ensure_ascii=False)
         return "https://datastudio.google.com/u/0/explorer?config=" + quote_plus(preview_config)
 
-    def get_first_sql_comments(self, part: list):
+    @classmethod
+    def get_first_sql_comments(cls, part: list):
         text_mode = "\n".join(part)
         comments = text_mode.split("/*")[1].split("*/", 1)[0] if "/*" in text_mode else ""
-        return comments.split("\n")
+        return markdown.markdown(comments)
 
     def view_parser(self, view_name: str):
-        with open(os.path.join(self.model_path, "views", view_name, "main.sql")) as fp:
+        with open(os.path.join(self.model_path, "views", view_name + ".sql")) as fp:
             view_query = deque([line.rstrip() for line in fp])
         parsed_data = {"nodes": []}
         begin, body, end = [], [], []
@@ -86,7 +85,7 @@ class Builder():
         while True:
             begin.append(view_query.popleft())
             if begin[-1].strip().lower() == "with" or not view_query:
-                parsed_data["comment"] = self.get_first_sql_comments(begin)
+                parsed_data["comments"] = self.get_first_sql_comments(begin)
                 break
         while True:
             end.append(view_query.pop())
@@ -103,6 +102,7 @@ class Builder():
         for node in body:
             node_dict, current_keyword = {"void": []}, "void"
             node_dict["comments"] = self.get_first_sql_comments(node)
+            node_dict["code"] = "\n".join(node)
             for line in node:
                 if "name" not in node_dict:
                     node_dict["name"] = line.strip().split(" ")[0]
@@ -113,13 +113,19 @@ class Builder():
                 node_dict[current_keyword].append(line)
             if "from" in node_dict:
                 from_clause = " ".join([frag.strip() for frag in node_dict["from"]]).split(" ")[1:]
-                node_dict["dependencies"] = []
+                node_dict["dependencies"], alias_flag = [], False
                 for piece in from_clause:
+                    if alias_flag:
+                        alias_flag = False
+                        continue
+                    if piece.upper() == "AS":
+                        alias_flag = True
+                        continue
                     if piece.upper() in ["USING", "ON"]:
                         break
-                    if piece.upper() in ["JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS", "FULL", "),"]:
+                    if piece.upper() in ["UNION", "INTERSECT", "EXCEPT", "ALL", "DISTINCT",
+                                         "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS", "FULL", "),"]:
                         continue
                     node_dict["dependencies"].append(piece)
             parsed_data["nodes"].append(node_dict)
         return parsed_data
-
