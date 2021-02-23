@@ -33,6 +33,7 @@ setuptools.setup(
     install_requires=[
         'google-auth',
         'google-cloud-bigquery',
+        'Markdown',
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
